@@ -11,3 +11,4 @@ coverage/
 .cloud-harness-state/
 deploy/.generated/
 .cloud-harness-test-fixtures/
+.local-runtime/

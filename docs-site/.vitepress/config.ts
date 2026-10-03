@@ -104,6 +104,7 @@ export default defineConfig({
           { text: 'Getting Started', link: '/getting-started' },
           { text: 'Connect MCP Client', link: '/connect' },
           { text: 'MCP Gateway', link: '/mcp-gateway' },
+          { text: 'Independent Chat API', link: '/chat-api' },
           { text: 'Agent Toolkits & Skills', link: '/agent-toolkits' }
         ]
       },

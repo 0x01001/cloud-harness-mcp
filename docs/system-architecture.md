@@ -84,6 +84,17 @@ opaque, short-lived capability leases with pre-reserved token and cost budgets.
 
 Third-party agent toolkits are acquired and normalized via disposable clone helpers running on a dedicated internal Docker network (`cloud-harness-provisioning`). All helper egress routes through the dual-homed `provisioning-proxy` (port 3128) with DNS destination allowlists. Normalized bundles are published to runner Content-Addressed Storage (`TOOLKIT_CACHE_ROOT`) and mounted into executors read-only at `/opt/cloud-harness/owner-skills:ro` or staged into `.cloud-harness/skills` under explicit confirmation.
 
+## Independent Chat API
+
+[`apps/chat-api`](../apps/chat-api) is a separate host-local composition root,
+not a fourth MCP transport or the internal leased Model Gateway. A remote
+OpenAI-compatible client reaches only its loopback listener through ngrok;
+the app authenticates a separate shared chat key and forwards the fixed native
+Chat/Responses/models routes to one public HTTPS provider using a distinct key.
+It has no runner, database, tool execution, or agent-lease dependency. Private
+DNS-validated/pinned egress and lifecycle owners are linked in the
+[Chat API guide](chat-api.md); neither MCP deployments nor URLs are migrated.
+
 ## Composition roots and transports
 
 Cloud Harness MCP supports three distinct composition roots. The two

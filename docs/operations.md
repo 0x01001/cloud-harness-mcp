@@ -22,6 +22,19 @@ The systemd and Compose owners are
 [`compose.yaml`](../compose.yaml), and
 [`compose.production.yaml`](../compose.production.yaml).
 
+## Independent Chat API operations
+
+The [Chat API guide](chat-api.md) covers foreground startup, SDK smoke, and the
+chat-only macOS lifecycle. Command authority is [`package.json`](../package.json);
+[`scripts/chat-runtime.mjs`](../scripts/chat-runtime.mjs) owns scoped LaunchAgents,
+readiness/ownership checks, ngrok, and bounded sanitized logs. Its readiness
+does not probe the provider, and its stop/uninstall does not touch MCP state.
+Rotate the shared chat key by replacing its private file and restarting; revoke
+provider/ngrok credentials separately. No conversations are stored locally;
+retention and Responses continuation/storage remain upstream-owned. Login,
+sleep, and network loss can interrupt streams; no inference is replayed.
+Live provider, tunnel, and lifecycle rollout still require authorization/proof.
+
 ## Persistent and ephemeral data
 
 The production defaults place:

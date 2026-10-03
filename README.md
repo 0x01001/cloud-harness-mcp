@@ -202,6 +202,16 @@ command = "node"
 args = ["/path/to/cloud-harness-mcp/apps/api/dist/index.js", "--transport", "stdio", "--workspace", "/path/to/my-project"]
 ```
 
+## Independent Chat API
+
+The separate `apps/chat-api` process exposes native OpenAI-compatible Chat
+Completions, Responses, and authenticated model discovery without MCP, runner,
+Docker, or agent leases. It executes no tools and uses separate chat/provider
+credentials. See the [Chat API boundary guide](docs/chat-api.md) and
+[setup, SDK smoke, and macOS/ngrok operations](https://docs.harness.agentkit.best/chat-api).
+No live provider or public tunnel capability is claimed; rollout requires
+operator authorization and the pending acceptance gates.
+
 ## MCP tools
 
 The public tool names are owned by

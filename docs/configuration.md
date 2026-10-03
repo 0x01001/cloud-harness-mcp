@@ -22,6 +22,53 @@ Use those files when an exact default or allowed range matters; this document
 records the decisions behind the settings rather than copying a second mutable
 inventory.
 
+## Independent Chat API configuration
+
+The [Chat API](chat-api.md) does not use Compose `.env`, MCP auth modes, managed
+keys, or agent leases. `npm run start:chat` and its macOS lifecycle default to
+this checkout's ignored `apps/chat-api/.env`, derived from source/compiled module
+or repository location, never CWD. An explicit absolute `CHAT_CONFIG_FILE`
+override remains available outside the checkout. The exact app-local `.env` is
+the only checkout exception: owner-owned regular file at exact `0600`, no leaf
+or immediate-parent symlink, and an owner-owned parent that is not group/world
+writable (`0755` allowed). All other private files/config overrides stay outside
+the checkout at exact `0600` with an owner-owned parent at exact `0700` and no
+leaf/immediate-parent symlink; unsafe or missing configuration fails closed.
+
+The provider credential is inline `CHAT_UPSTREAM_API_KEY`; there is no
+`provider.key` or backwards alias for `CHAT_UPSTREAM_API_KEY_FILE`.
+`CHAT_API_KEY_FILE` names the required external primary client-key file. With
+Node >=24 and dependencies installed (`npm ci`), prepare the private `.env`
+with that absolute path and run `make gen` / `npm run chat:gen`; it builds chat,
+then exclusively creates the missing primary file or, if it exists, preserves
+it and exclusively adds `${CHAT_API_KEY_FILE}.d/<random-UUID>.key`. Each key is
+`crypto.randomBytes(32).toString('hex')`; files are `0600`, directories `0700`,
+and the generator prints the freshly generated 64-hex key followed by a newline.
+`make gen` / `npm --silent run chat:gen` print only that new key on stdout; build
+diagnostics go to stderr. Plain `npm run chat:gen` adds npm script banners.
+Copy the printed key directly into `Authorization: Bearer <chat-key>`, never a
+file path or provider key. The key file is persisted internally for server auth;
+existing client keys and the provider key are not printed. Terminal output is
+now sensitive: avoid CI/shared logs and share the key securely.
+At startup the primary and generated keys are accepted with
+the same full inference access and shared admission/provider quota; they are
+not per-user budgets or admin credentials. Every client key must differ from
+the provider key; keep chat, provider, MCP, and ngrok credentials separate and
+never commit secrets. Invalid generated-key entries/permissions/symlinks fail
+closed. Generation does not manipulate services or make provider requests.
+Adding a key requires restarting the foreground process or `make stop` then
+`make start` for the existing installed runtime; `make start` alone does not
+restart it. To revoke one generated key, remove only its specific `.d` file and
+restart, leaving the primary and other generated files unchanged.
+Installed runtime identity depends on the config path: follow the guide's
+explicit old-path stop/uninstall procedure before switching from the former
+external `chat.env` default, or retain that absolute override consistently.
+Exact names, validation, defaults, and precedence are owned by
+[`apps/chat-api/src/config.ts`](../apps/chat-api/src/config.ts), with macOS
+file/lifecycle wiring owned by
+[`scripts/chat-runtime.mjs`](../scripts/chat-runtime.mjs). The linked user guide
+contains the operator template; this document does not duplicate that inventory.
+
 ## Authentication and request policy
 
 `AUTH_MODE` selects one mutually exclusive deployment contract:

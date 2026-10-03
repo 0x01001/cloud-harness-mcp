@@ -14,6 +14,16 @@ skill scripts, and repository-defined deployments are intentional remote code
 execution inside the executor. Public authentication controls who may request
 that execution; it does not make the repository code trustworthy.
 
+## Independent Chat API boundary
+
+The [standalone Chat API](chat-api.md) has separate loopback, Bearer-key, and
+public-HTTPS egress boundaries; MCP auth and leased Model Gateway budgets do not
+apply. It forwards inference data and executes no tools. A leaked shared chat
+key can still spend provider quota. Ngrok and the provider see traffic; review
+their retention/capture settings and configure upstream spend controls before
+authorized public rollout. See the guide and its executable owners for exact
+constant-time auth, private-file, DNS-pinning, and admission policies.
+
 ## Trust boundaries
 
 Trusted control plane:
