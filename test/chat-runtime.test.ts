@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { appReady, assertRuntime, bootstrap, bootout, checkNgrokHelp, healthReady, jobOwned, lifecycleLog, listenerOwned, ngrokArgs, plist, privateFile, readConfigEnv, resolveExecutable, restartAllowed, runtimePaths } from '../scripts/chat-runtime.mjs';
+import { appReady, assertRuntime, bootstrap, bootout, checkNgrokHelp, healthReady, jobOwned, lifecycleLog, listenerOwned, ngrokArgs, ngrokConfigFile, plist, privateFile, readConfigEnv, resolveExecutable, restartAllowed, runtimePaths } from '../scripts/chat-runtime.mjs';
 import type { RuntimeManifest } from '../scripts/chat-runtime.mjs';
 
 const exec = promisify(execFile);
@@ -18,11 +18,12 @@ async function fixture() {
   const secrets = path.join(directory, 'private');
   await Promise.all([mkdir(root), mkdir(home), mkdir(secrets, { mode: 0o700 })]);
   const config = path.join(secrets, 'chat.env');
-  await writeFile(config, 'CHAT_API_PORT=3211\nCHAT_PUBLIC_HOST=chat.example.ngrok.app\n', { mode: 0o600 });
+  const ngrokConfig = path.join(directory, 'existing-ngrok', 'ngrok-translate.yml');
+  await writeFile(config, `CHAT_API_PORT=3211\nCHAT_PUBLIC_HOST=chat.example.ngrok.app\nCHAT_NGROK_CONFIG_FILE="${ngrokConfig}"\n`, { mode: 0o600 });
   const paths = runtimePaths({ CHAT_CONFIG_FILE: config }, home, root);
   await mkdir(paths.state, { recursive: true, mode: 0o700 });
   await mkdir(paths.agents, { recursive: true });
-  const manifest = { ...paths, node: process.execPath, script: path.join(root, 'scripts/chat-runtime.mjs'), ngrok: '/absolute/ngrok', ngrokConfig: path.join(secrets, 'ngrok.yml'), entry: path.join(root, 'apps/chat-api/dist/index.js') };
+  const manifest = { ...paths, node: process.execPath, script: path.join(root, 'scripts/chat-runtime.mjs'), ngrok: '/absolute/ngrok', ngrokConfig, entry: path.join(root, 'apps/chat-api/dist/index.js') };
   return { directory, root, home, secrets, config, paths, manifest };
 }
 
@@ -159,6 +160,54 @@ describe('isolated chat runtime', () => {
     expect(() => checkNgrokHelp(stdout)).not.toThrow();
     expect(() => checkNgrokHelp('--url')).toThrow('required');
     await expect(resolveExecutable('missing', directory)).rejects.toThrow('Install it separately');
+  });
+
+  it('requires an explicit private ngrok config without defaults and forwards only its configured path', async () => {
+    const { root, home, config, paths, manifest } = await fixture();
+    const shared = [path.join(home, 'Library', 'Application Support', 'ngrok', 'ngrok.yml'), path.join(home, '.config', 'ngrok', 'ngrok.yml'), path.join(home, 'Library', 'Application Support', 'ngrok-translate', 'ngrok.yml')];
+    for (const filename of shared) {
+      await mkdir(path.dirname(filename), { recursive: true, mode: 0o700 });
+      await writeFile(filename, 'version: "3"\n', { mode: 0o600 });
+      await expect(privateFile(filename, root)).resolves.toBe(filename);
+    }
+    await writeFile(config, 'CHAT_API_PORT=3211\n');
+    vi.stubEnv('CHAT_NGROK_CONFIG_FILE', shared[0]);
+    try { await expect(ngrokConfigFile(paths)).rejects.toThrow('Set CHAT_NGROK_CONFIG_FILE'); }
+    finally { vi.unstubAllEnvs(); }
+    await writeFile(config, 'CHAT_NGROK_CONFIG_FILE=relative/ngrok-translate.yml\n');
+    await expect(ngrokConfigFile(paths)).rejects.toThrow('absolute path');
+    await writeFile(config, `CHAT_NGROK_CONFIG_FILE="${manifest.ngrokConfig}"\n`);
+    await expect(ngrokConfigFile(paths)).rejects.toThrow('No default ngrok config is used');
+    await mkdir(path.dirname(manifest.ngrokConfig), { recursive: true, mode: 0o700 });
+    await writeFile(manifest.ngrokConfig, 'version: "3"\n', { mode: 0o600 });
+    await expect(ngrokConfigFile(paths)).resolves.toBe(manifest.ngrokConfig);
+    await expect(ngrokConfigFile(manifest)).resolves.toBe(manifest.ngrokConfig);
+    const args = ngrokArgs(manifest, { port: 3211, publicHost: 'chat.example.ngrok.app' });
+    expect(args.slice(-2)).toEqual(['--config', manifest.ngrokConfig]);
+    for (const filename of shared) expect(args).not.toContain(filename);
+    await chmod(manifest.ngrokConfig, 0o644);
+    await expect(ngrokConfigFile(manifest)).rejects.toThrow('0600 file with a 0700 parent');
+    await chmod(manifest.ngrokConfig, 0o600);
+    await chmod(path.dirname(manifest.ngrokConfig), 0o755);
+    await expect(ngrokConfigFile(manifest)).rejects.toThrow('0700 parent');
+  });
+
+  it('rejects stale manifest config paths but permits verified migration stop', async () => {
+    const { home, paths, manifest } = await fixture();
+    await mkdir(path.dirname(manifest.ngrokConfig), { recursive: true, mode: 0o700 });
+    await writeFile(manifest.ngrokConfig, 'version: "3"\n', { mode: 0o600 });
+    const legacy = { ...manifest, ngrokConfig: path.join(home, 'Library', 'Application Support', 'ngrok', 'ngrok.yml') };
+    await expect(ngrokConfigFile(legacy)).rejects.toThrow('Run chat:install again');
+    const fallback = { ...manifest, ngrokConfig: path.join(home, '.config', 'ngrok', 'ngrok.yml') };
+    await expect(ngrokConfigFile(fallback)).rejects.toThrow('differs from CHAT_NGROK_CONFIG_FILE');
+    await writeFile(path.join(paths.agents, `${paths.labels.tunnel}.plist`), plist(legacy, 'tunnel'), { mode: 0o600 });
+    const calls: string[][] = [];
+    await bootout(legacy, 'tunnel', async (_binary: string, args: string[]) => {
+      calls.push(args);
+      return args[0] === 'print' ? job(legacy, 'tunnel') : '';
+    });
+    expect(calls.map(([action]) => action)).toEqual(['print', 'bootout']);
+    await expect(bootout(legacy, 'tunnel', async () => job(legacy, 'tunnel').replace(legacy.script, '/unrelated.js'))).rejects.toThrow('unowned');
   });
 
   it('renders absolute secret-free foreground LaunchAgents and disables inspection/raw logging', async () => {

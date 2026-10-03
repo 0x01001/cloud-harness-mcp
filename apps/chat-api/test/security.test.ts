@@ -132,7 +132,7 @@ describe('consumer validation and byte boundaries', () => {
       const app = await setup((_req, res) => {
         res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '1', 'x-request-id': 'safe-request-123', 'set-cookie': `key=${PROVIDER_KEY}`, 'x-provider-secret': PROVIDER_KEY });
         res.end(JSON.stringify({ error: { message: `denied ${PROVIDER_KEY} ${CHAT_KEY}`, type: 'rate_limit_error', param: null, code: 'quota' } }));
-      });
+      }, { upstreamKeys: [PROVIDER_KEY, 'second-provider-secret-12345678901234567890'] });
       const response = await app.send('/v1/chat/completions', chatBody, { cookie: `key=${CHAT_KEY}`, 'x-arbitrary': 'private', origin: 'https://browser.example' });
       expect(response.status).toBe(429);
       const body = await response.text();

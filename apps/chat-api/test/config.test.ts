@@ -71,13 +71,58 @@ describe('fail-closed standalone chat config', () => {
     const config = await loadChatConfig({ ...env, CHAT_ALLOWED_MODELS: `${MODEL}, second-model` });
     expect(config.port).toBe(3211);
     expect(config.apiKeyDigests).toEqual([createHash('sha256').update(CHAT_KEY).digest()]);
-    expect(config.upstreamApiKey).toBe(PROVIDER_KEY);
+    expect(config.upstreamApiKeys).toEqual([PROVIDER_KEY]);
     expect([...config.allowedModels]).toEqual([MODEL, 'second-model']);
     expect(config.limits).toEqual({ requestBytes: 4 * 1024 * 1024, responseBytes: 16 * 1024 * 1024, concurrency: 4, requestsPerMinute: 60, deadlineMs: 300000 });
   });
 
+  it('preserves provider key order and accepts one or multiple independently validated keys', async () => {
+    const { env } = await files();
+    const keys = [PROVIDER_KEY, 'a'.repeat(32), 'b'.repeat(4096)];
+    const config = await loadChatConfig({ ...env, CHAT_UPSTREAM_API_KEY: keys.join(',') });
+    expect(config.upstreamApiKeys).toEqual(keys);
+    expect(config.upstreamApiKeys[0]).toBe(PROVIDER_KEY);
+  });
+
+  it('rejects empty, duplicate and invalid later provider keys in startup and generation without echoing secrets', async () => {
+    const { env, directory } = await files();
+    const originalEntries = await readdir(directory);
+    const second = 'c'.repeat(64);
+    const invalid = [
+      ',', `,${PROVIDER_KEY}`, `${PROVIDER_KEY},`, `${PROVIDER_KEY},,${second}`,
+      `${PROVIDER_KEY},${PROVIDER_KEY}`, `${PROVIDER_KEY},${second},${PROVIDER_KEY}`,
+      ...['short', 'x'.repeat(4097), 'replace-me-placeholder-12345678901234567890', 'test-key-123456789012345678901234567890', `${second}\n`, ` ${second}`, `${second}\t`, `${second}\u0000`, 'é'.repeat(32)].map(value => `${PROVIDER_KEY},${value}`)
+    ];
+    for (const value of invalid) {
+      const overrides = { ...env, CHAT_UPSTREAM_API_KEY: value };
+      for (const action of [loadChatConfig, generateChatKey]) {
+        await expect(action(overrides)).rejects.toEqual(new Error('Invalid CHAT_UPSTREAM_API_KEY'));
+      }
+    }
+    expect(await readdir(directory)).toEqual(originalEntries);
+  });
+
+  it.each(['primary', 'additional'])('rejects a %s client key matching a non-first provider at startup and generation', async target => {
+    const { env, chat, directory } = await files();
+    const second = 'c'.repeat(64);
+    const overrides = { ...env, CHAT_UPSTREAM_API_KEY: `${PROVIDER_KEY},${second}` };
+    let file = chat;
+    if (target === 'additional') {
+      await mkdir(`${chat}.d`, { mode: 0o700 });
+      file = join(`${chat}.d`, 'additional.key');
+    }
+    await writeFile(file, `${second}\n`, { mode: 0o600 });
+    const original = await readFile(file);
+    const originalEntries = await readdir(directory);
+    await expect(loadChatConfig(overrides)).rejects.toEqual(new Error('Chat and upstream credentials must be distinct'));
+    await expect(generateChatKey(overrides)).rejects.toEqual(new Error('Chat and upstream credentials must be distinct'));
+    expect(await readFile(file)).toEqual(original);
+    expect(await readdir(directory)).toEqual(originalEntries);
+  });
+
   it('preserves old bytes and config while adding private, distinct credentials accepted at startup', async () => {
     const { env, chat, path } = await files();
+    env.CHAT_UPSTREAM_API_KEY = `${PROVIDER_KEY},${'c'.repeat(64)}`;
     await writeFile(path, dotenv(env));
     await writeFile(chat, `${CHAT_KEY}\r\n`);
     const original = await readFile(chat);
@@ -95,8 +140,10 @@ describe('fail-closed standalone chat config', () => {
       expect(value).toMatch(/^[0-9a-f]{64}\n$/);
       return value.trim();
     }));
+    for (const provider of env.CHAT_UPSTREAM_API_KEY.split(',')) expect(keys).not.toContain(provider);
     const config = await loadChatConfig({ CHAT_CONFIG_FILE: path });
     expect(config.apiKeyDigests).toHaveLength(3);
+    expect(config.upstreamApiKeys).toEqual(env.CHAT_UPSTREAM_API_KEY.split(','));
     for (const value of [CHAT_KEY, ...keys]) expect(config.apiKeyDigests).toContainEqual(createHash('sha256').update(value).digest());
     expect(beforeGeneration.apiKeyDigests).toEqual([createHash('sha256').update(CHAT_KEY).digest()]);
   });
@@ -247,8 +294,8 @@ describe('fail-closed standalone chat config', () => {
       await expect(loadChatConfig({ ...env, CHAT_UPSTREAM_API_KEY: value })).rejects.toThrow('Invalid CHAT_UPSTREAM_API_KEY');
     }
     await expect(loadChatConfig({ ...env, CHAT_UPSTREAM_API_KEY: CHAT_KEY })).rejects.toThrow('credentials must be distinct');
-    expect((await loadChatConfig({ ...env, CHAT_UPSTREAM_API_KEY: 'a'.repeat(32) })).upstreamApiKey).toBe('a'.repeat(32));
-    expect((await loadChatConfig({ ...env, CHAT_UPSTREAM_API_KEY: 'a'.repeat(4096) })).upstreamApiKey).toHaveLength(4096);
+    expect((await loadChatConfig({ ...env, CHAT_UPSTREAM_API_KEY: 'a'.repeat(32) })).upstreamApiKeys).toEqual(['a'.repeat(32)]);
+    expect((await loadChatConfig({ ...env, CHAT_UPSTREAM_API_KEY: 'a'.repeat(4096) })).upstreamApiKeys).toEqual(['a'.repeat(4096)]);
   });
 
   it('rejects insecure upstream, ambiguous models, removed or unknown config and unbounded limits', async () => {
@@ -262,11 +309,20 @@ describe('fail-closed standalone chat config', () => {
     await expect(loadChatConfig({ CHAT_CONFIG_FILE: path })).rejects.toThrow('Invalid CHAT_CONFIG_FILE');
   });
 
+  it('accepts the lifecycle ngrok config setting without requiring it for loopback operation', async () => {
+    const { env, path, directory } = await files();
+    const ngrokConfig = join(directory, 'ngrok-translate.yml');
+    const loopback = await loadChatConfig(env);
+    await writeFile(path, dotenv({ ...env, CHAT_NGROK_CONFIG_FILE: ngrokConfig }));
+    expect((await loadChatConfig({ CHAT_CONFIG_FILE: path })).port).toBe(loopback.port);
+    expect((await loadChatConfig({ ...env, CHAT_NGROK_CONFIG_FILE: ngrokConfig })).publicHost).toBeUndefined();
+  });
+
   it('requires a private absolute config override and honors environment overrides without echoing secrets', async () => {
     const { env, path, directory } = await files();
     await writeFile(path, dotenv({ ...env, CHAT_API_PORT: '3212' }));
     expect((await loadChatConfig({ CHAT_CONFIG_FILE: path, CHAT_API_PORT: '3213' })).port).toBe(3213);
-    expect((await loadChatConfig({ CHAT_CONFIG_FILE: path, CHAT_UPSTREAM_API_KEY: 'b'.repeat(32) })).upstreamApiKey).toBe('b'.repeat(32));
+    expect((await loadChatConfig({ CHAT_CONFIG_FILE: path, CHAT_UPSTREAM_API_KEY: 'b'.repeat(32) })).upstreamApiKeys).toEqual(['b'.repeat(32)]);
     await expect(loadChatConfig({ CHAT_CONFIG_FILE: 'relative.env' })).rejects.toThrow('CHAT_CONFIG_FILE');
     await expect(loadChatConfig({ CHAT_CONFIG_FILE: '' })).rejects.toThrow('CHAT_CONFIG_FILE');
     await expect(loadChatConfig({ CHAT_CONFIG_FILE: join(directory, 'missing.env') })).rejects.toThrow('CHAT_CONFIG_FILE');

@@ -3,7 +3,7 @@ import { request } from 'node:http';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { shutdownChatServer } from '../src/app.js';
-import { CHAT_KEY, MODEL, chatBody, chatResult, fixture, json, deferred } from './fixture.js';
+import { CHAT_KEY, PROVIDER_KEY, MODEL, chatBody, chatResult, fixture, json, deferred } from './fixture.js';
 import type { FixtureHandler, FixtureOptions } from './fixture.js';
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -28,14 +28,14 @@ async function collectBroken(response: Response) {
   return { interrupted, text: Buffer.concat(chunks).toString() };
 }
 
-describe('bounded lifecycle, admission and no automatic retry', () => {
+describe('bounded lifecycle, admission and no non-quota retry', () => {
   it('deadline before headers returns504, aborts upstream and releases concurrency for next call', async () => {
     const disconnected = deferred();
     let count = 0;
     const app = await setup((_req, res) => {
       if (++count === 1) res.on('close', () => disconnected.resolve());
       else json(res, chatResult);
-    }, { limits: { deadlineMs: 80, concurrency: 1 } });
+    }, { limits: { deadlineMs: 80, concurrency: 1 }, upstreamKeys: [PROVIDER_KEY, 'second-provider-secret-12345678901234567890'] });
     const response = await app.send('/v1/chat/completions', chatBody);
     expect(response.status).toBe(504);
     expect(await response.json()).toMatchObject({ error: { code: 'deadline_exceeded' } });
@@ -55,7 +55,7 @@ describe('bounded lifecycle, admission and no automatic retry', () => {
         res.write(route.endsWith('/responses') ? 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"partial"}\n\n' : 'data: {"partial":true}\n\n');
         await delay(20);
         res.destroy();
-      }, { limits: { concurrency: 1 } });
+      }, { limits: { concurrency: 1 }, upstreamKeys: [PROVIDER_KEY, 'second-provider-secret-12345678901234567890'] });
       const response = await app.send(route, { ...chatBody, input: 'fixture', stream: true });
       expect(response.status).toBe(200);
       const result = await collectBroken(response);
@@ -74,7 +74,7 @@ describe('bounded lifecycle, admission and no automatic retry', () => {
         res.write(route.endsWith('/responses') ? 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"partial"}\n\n' : 'data: {"id":"partial","object":"chat.completion.chunk","choices":[{"delta":{"content":"partial"}}]}\n\n');
         await delay(15);
         res.end();
-      });
+      }, { upstreamKeys: [PROVIDER_KEY, 'second-provider-secret-12345678901234567890'] });
       const broken = await collectBroken(await app.send(route, { ...chatBody, input: 'fixture', stream: true }));
       expect(broken.interrupted).toBe(true);
       expect(broken.text).not.toMatch(/\[DONE\]|response\.completed/);
@@ -175,7 +175,7 @@ describe('bounded lifecycle, admission and no automatic retry', () => {
     } finally { req.destroy(); }
   });
 
-  it('rate window resets only at boundary;429 and network errors never retry', async () => {
+  it('rate window resets only at boundary; admission429 and network errors never retry', async () => {
     let now = 0;
     const app = await setup((_req, res) => json(res, chatResult), { now: () => now, limits: { requestsPerMinute: 1 } });
     expect((await app.send('/v1/chat/completions', chatBody)).status).toBe(200);
@@ -185,7 +185,7 @@ describe('bounded lifecycle, admission and no automatic retry', () => {
     expect(app.calls).toBe(1);
     now = 60000;
     expect((await app.send('/v1/chat/completions', chatBody)).status).toBe(200);
-    const network = await setup((_req, res) => res.destroy());
+    const network = await setup((_req, res) => res.destroy(), { upstreamKeys: [PROVIDER_KEY, 'second-provider-secret-12345678901234567890'] });
     expect((await network.send('/v1/chat/completions', chatBody)).status).toBe(502);
     expect(network.calls).toBe(1);
   });

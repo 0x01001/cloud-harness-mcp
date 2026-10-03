@@ -35,8 +35,10 @@ writable (`0755` allowed). All other private files/config overrides stay outside
 the checkout at exact `0600` with an owner-owned parent at exact `0700` and no
 leaf/immediate-parent symlink; unsafe or missing configuration fails closed.
 
-The provider credential is inline `CHAT_UPSTREAM_API_KEY`; there is no
-`provider.key` or backwards alias for `CHAT_UPSTREAM_API_KEY_FILE`.
+Provider credentials are inline `CHAT_UPSTREAM_API_KEY`: one key or an ordered
+comma-separated list of nonempty unique keys, without spaces. Each key must be
+32–4096 ASCII characters with no whitespace/control characters or placeholders.
+There is no `provider.key` or backwards alias for `CHAT_UPSTREAM_API_KEY_FILE`.
 `CHAT_API_KEY_FILE` names the required external primary client-key file. With
 Node >=24 and dependencies installed (`npm ci`), prepare the private `.env`
 with that absolute path and run `make gen` / `npm run chat:gen`; it builds chat,
@@ -52,11 +54,12 @@ existing client keys and the provider key are not printed. Terminal output is
 now sensitive: avoid CI/shared logs and share the key securely.
 At startup the primary and generated keys are accepted with
 the same full inference access and shared admission/provider quota; they are
-not per-user budgets or admin credentials. Every client key must differ from
-the provider key; keep chat, provider, MCP, and ngrok credentials separate and
+not per-user budgets or admin credentials. Every client key, including a newly
+generated key, must differ from every provider key; keep chat, provider, MCP,
+and ngrok credentials separate and
 never commit secrets. Invalid generated-key entries/permissions/symlinks fail
 closed. Generation does not manipulate services or make provider requests.
-Adding a key requires restarting the foreground process or `make stop` then
+Adding/changing any client or provider key requires restarting the foreground process or `make stop` then
 `make start` for the existing installed runtime; `make start` alone does not
 restart it. To revoke one generated key, remove only its specific `.d` file and
 restart, leaving the primary and other generated files unchanged.
@@ -68,6 +71,46 @@ Exact names, validation, defaults, and precedence are owned by
 file/lifecycle wiring owned by
 [`scripts/chat-runtime.mjs`](../scripts/chat-runtime.mjs). The linked user guide
 contains the operator template; this document does not duplicate that inventory.
+
+Each request starts at the first provider key and tries each key at most once.
+For `/v1/models`, Chat Completions, and Responses, failover occurs only before
+the downstream response starts, on HTTP `429` with a valid native JSON error:
+`code: insufficient_quota`, or `type: insufficient_quota` when code is absent/null.
+A different code takes precedence over type. All attempts retain the same
+endpoint/model/body, HTTPS policy, admission slot, and total deadline; the prior
+response body is disposed before advancing. There is no model/provider fallback,
+sticky rotation, generic rate-limit/`401`/`5xx`/network/timeout retry, or SSE replay.
+If all keys exhaust quota, the last sanitized `429` is returned. Error sanitization
+redacts all configured keys, even untried provider keys. Keys in one provider
+project may share quota; Responses `previous_response_id` can depend on its
+originating project and is not portable across projects.
+
+The macOS Chat lifecycle requires `CHAT_NGROK_CONFIG_FILE` in the selected private
+Chat `.env`: a **literal absolute path** to the separate ngrok config, for example
+`CHAT_NGROK_CONFIG_FILE=/absolute/private/ngrok-translate.yml`.
+Lifecycle reads that file setting, not an ambient shell override, and passes
+explicit `--config`; there is **no default or shared-config fallback**. Direct
+loopback app startup and key generation do not require it. Install/start/status
+do; stop/uninstall/logs can manage the verified instance without reading it.
+Reusing the ngrok executable is safe; reusing another application's config or
+secrets is not. Leave an existing dedicated authtoken untouched: no
+`add-authtoken` command is needed. For a new file, use a private editor with
+ngrok v3 `agent.authtoken` and `agent.web_addr: false` (avoids another agent's
+inspection port 4040). Require owner-owned exact file `0600` and directory
+`0700`, with no leaf/immediate-parent symlink. Never run bare
+`ngrok config add-authtoken`; the [user guide](../docs-site/chat-api.md#dedicated-ngrok-configuration)
+shows private setup and an explicit `--config` alternative, warning that real
+tokens in CLI arguments can leak through argv/history. Never copy another
+application's token or commit it. Use a different assigned domain; separate
+configs/tokens do not bypass ngrok concurrent-agent or account limits.
+
+Install/start use scoped LaunchAgent labels/state without touching another
+application's config or process. Install pins the selected ngrok config path;
+changing `CHAT_NGROK_CONFIG_FILE` or using a prior shared-config manifest requires
+reinstall before start. Stop/uninstall can remove only that instance's verified
+old jobs; keep its exact `CHAT_CONFIG_FILE` identity during cleanup, then install
+with the selected dedicated ngrok config secured. No automatic secret copying
+or old-job migration occurs.
 
 ## Authentication and request policy
 

@@ -7,16 +7,16 @@ import type { ChatConfig } from '../src/config.js';
 import type { ProxyTransport, ProxyResponse } from '../src/proxy.js';
 
 export type FixtureHandler = (request: IncomingMessage, response: ServerResponse) => void | Promise<void>;
-export type FixtureOptions = { limits?: Partial<ChatConfig['limits']>; now?: () => number; apiKeys?: readonly string[] };
+export type FixtureOptions = { limits?: Partial<ChatConfig['limits']>; now?: () => number; apiKeys?: readonly string[]; upstreamKeys?: readonly string[] };
 export const CHAT_KEY = 'chat-test-key-not-a-provider-key-1234567890';
 export const PROVIDER_KEY = 'provider-test-secret-12345678901234567890';
 export const MODEL = 'openai/native-model';
-export const config = (limits: Partial<ChatConfig['limits']> = {}, apiKeys: readonly string[] = [CHAT_KEY]): ChatConfig => ({
+export const config = (limits: Partial<ChatConfig['limits']> = {}, apiKeys: readonly string[] = [CHAT_KEY], upstreamKeys: readonly string[] = [PROVIDER_KEY]): ChatConfig => ({
   port: 0,
   publicHost: 'chat.example.test',
   upstreamBaseUrl: 'https://provider.example.test/prefix/v1',
   apiKeyDigests: apiKeys.map(key => createHash('sha256').update(key).digest()),
-  upstreamApiKey: PROVIDER_KEY,
+  upstreamApiKeys: upstreamKeys,
   allowedModels: new Set([MODEL]),
   limits: { requestBytes: 4096, responseBytes: 65536, concurrency: 4, requestsPerMinute: 60, deadlineMs: 2000, ...limits },
 });
@@ -73,7 +73,7 @@ export async function fixture(handler: FixtureHandler, options: FixtureOptions =
     req.end(body);
     return promise;
   };
-  const server = createChatServer(config(options.limits, options.apiKeys), { transport, now: options.now });
+  const server = createChatServer(config(options.limits, options.apiKeys, options.upstreamKeys), { transport, now: options.now });
   const base = await listen(server);
   return {
     server, upstream, base, captured,

@@ -18,7 +18,7 @@ const MAX_LOG_BYTES = 256 * 1024;
 const LOG_COPIES = 3;
 const RESTART_WINDOW_MS = 10 * 60_000;
 const RESTART_LIMIT = 5;
-const CONFIG_KEYS = new Set(['CHAT_API_PORT', 'CHAT_API_KEY_FILE', 'CHAT_UPSTREAM_BASE_URL', 'CHAT_UPSTREAM_API_KEY', 'CHAT_ALLOWED_MODELS', 'CHAT_PUBLIC_HOST', 'CHAT_MAX_REQUEST_BYTES', 'CHAT_MAX_RESPONSE_BYTES', 'CHAT_MAX_CONCURRENT_REQUESTS', 'CHAT_REQUESTS_PER_MINUTE', 'CHAT_REQUEST_DEADLINE_MS']);
+const CONFIG_KEYS = new Set(['CHAT_API_PORT', 'CHAT_API_KEY_FILE', 'CHAT_UPSTREAM_BASE_URL', 'CHAT_UPSTREAM_API_KEY', 'CHAT_ALLOWED_MODELS', 'CHAT_PUBLIC_HOST', 'CHAT_NGROK_CONFIG_FILE', 'CHAT_MAX_REQUEST_BYTES', 'CHAT_MAX_RESPONSE_BYTES', 'CHAT_MAX_CONCURRENT_REQUESTS', 'CHAT_REQUESTS_PER_MINUTE', 'CHAT_REQUEST_DEADLINE_MS']);
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const xml = (value) => String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[char]);
 
@@ -69,6 +69,20 @@ export async function privateFile(filename, root) {
     throw new Error('Private files require owner-only 0600 files and 0700 parent directories.');
   }
   return resolved;
+}
+
+export async function ngrokConfigFile(paths) {
+  const env = await readConfigEnv(paths.config, paths.root, {});
+  if (!env.CHAT_NGROK_CONFIG_FILE || !path.isAbsolute(env.CHAT_NGROK_CONFIG_FILE)) {
+    throw new Error('Set CHAT_NGROK_CONFIG_FILE to the absolute path of your dedicated ngrok-translate config in the private chat config. No default ngrok config is used.');
+  }
+  let filename;
+  try { filename = await privateFile(env.CHAT_NGROK_CONFIG_FILE, paths.root); }
+  catch { throw new Error('CHAT_NGROK_CONFIG_FILE must select a private ngrok-translate config outside this checkout: a 0600 file with a 0700 parent directory, without symlinks. No default ngrok config is used.'); }
+  if (paths.ngrokConfig !== undefined && paths.ngrokConfig !== filename) {
+    throw new Error('Chat runtime ngrok config differs from CHAT_NGROK_CONFIG_FILE. Run chat:install again; chat:stop and chat:uninstall remain available.');
+  }
+  return filename;
 }
 
 async function configFile(filename, root) {
@@ -179,6 +193,7 @@ export async function bootout(manifest, kind, run = command) {
 }
 
 async function configFor(manifest) {
+  await ngrokConfigFile(manifest);
   await access(manifest.entry, constants.R_OK);
   const env = await readConfigEnv(manifest.config, manifest.root, { HOME: manifest.home, PATH: path.dirname(manifest.node) });
   let config;
@@ -281,6 +296,7 @@ export function restartAllowed(history, now = Date.now()) {
 }
 
 async function foreground(manifest, kind) {
+  await ngrokConfigFile(manifest);
   const registration = await loaded(manifest, kind);
   if (!registration || Number(registration.match(/\bpid = (\d+)/)?.[1]) !== process.pid) throw new Error('Foreground entry modes may only run as the registered LaunchAgent.');
   const history = [];
@@ -364,11 +380,7 @@ async function install(paths) {
   await command(launchctl, ['print', `gui/${process.getuid()}`]);
   const ngrok = await resolveExecutable('ngrok');
   checkNgrokHelp(await command(ngrok, ['http', '--help']));
-  let ngrokConfig;
-  for (const candidate of [path.join(paths.home, 'Library', 'Application Support', 'ngrok', 'ngrok.yml'), path.join(paths.home, '.config', 'ngrok', 'ngrok.yml')]) {
-    try { ngrokConfig = await privateFile(candidate, paths.root); break; } catch { /* Check supported ngrok config locations without reading credentials. */ }
-  }
-  if (!ngrokConfig) throw new Error('Missing private ngrok config. Configure ngrok separately; use 0600 file in a 0700 directory.');
+  const ngrokConfig = await ngrokConfigFile(paths);
   await command(ngrok, ['config', 'check', '--config', ngrokConfig]);
   const npm = process.env.npm_execpath;
   if (!npm || !path.isAbsolute(npm)) throw new Error('Run install through npm run chat:install (or make install).');
@@ -414,6 +426,7 @@ async function install(paths) {
 }
 
 async function start(manifest, config) {
+  await ngrokConfigFile(manifest);
   await bootstrap(manifest, 'app');
   await waitReady(manifest, config.port);
   await bootstrap(manifest, 'tunnel');
@@ -464,7 +477,7 @@ export async function main(argv = process.argv.slice(2)) {
 if (process.argv[1] && path.resolve(process.argv[1]) === script) {
   main().catch(() => {
     // Do not print arbitrary exception messages (config/build/agent may echo secrets).
-    console.error('Chat runtime command failed. Check Node >=24, macOS login session, private config permissions, build:chat and ngrok prerequisites; use chat:logs for sanitized lifecycle events.');
+    console.error('Chat runtime command failed. Check Node >=24, macOS login session, private config permissions, build:chat and ngrok prerequisites. Set CHAT_NGROK_CONFIG_FILE in the private chat config to an absolute dedicated ngrok-translate config path (0600 file, 0700 parent directory); no default ngrok config is used. Run chat:install after changing this path; chat:stop and chat:uninstall remain available. Use chat:logs for sanitized lifecycle events.');
     process.exitCode = 1;
   });
 }

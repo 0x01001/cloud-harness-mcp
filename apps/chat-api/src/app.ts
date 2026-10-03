@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { once } from 'node:events';
 import type { Readable } from 'node:stream';
 import type { ChatConfig } from './config.js';
-import { createProxyTransport, type ProxyDependencies, type ProxyTransport } from './proxy.js';
+import { createProxyTransport, type ProxyDependencies, type ProxyResponse, type ProxyTransport } from './proxy.js';
 const utf8 = new TextDecoder('utf-8', { fatal: true });
 
 class ChatError extends Error {
@@ -220,25 +220,37 @@ export function createChatServer(config: ChatConfig, dependencies: ProxyDependen
       }
       const upstream = new URL(config.upstreamBaseUrl);
       upstream.pathname += route.slice('/v1'.length);
-      const secrets = [candidate, config.upstreamApiKey];
-      const headers: Record<string, string> = { authorization: `Bearer ${config.upstreamApiKey}`, accept: stream ? 'text/event-stream' : 'application/json', 'accept-encoding': 'identity' };
+      const secrets = [candidate, ...config.upstreamApiKeys];
+      const headers: Record<string, string> = { accept: stream ? 'text/event-stream' : 'application/json', 'accept-encoding': 'identity' };
       if (body) { headers['content-type'] = 'application/json'; headers['content-length'] = String(body.length); }
-      const result = await transport({ url: upstream, method, headers, ...(body === undefined ? {} : { body }), signal });
-      result.body.on('error', () => { /* The reader reports failures; avoid an unhandled abort before reading. */ });
-      upstreamBody = result.body;
-      if (signal.aborted) throw new Error('Request aborted');
-      if (result.status >= 300 && result.status < 400) throw new ChatError(502, 'upstream_redirect_refused', 'Upstream redirect refused.');
-      if (result.headers['content-encoding'] && result.headers['content-encoding'] !== 'identity') throw new ChatError(502, 'invalid_upstream_response', 'Unsupported upstream content encoding.');
+      let result: ProxyResponse;
+      let error: Record<string, unknown> | undefined;
+      for (let index = 0; ; index++) {
+        if (signal.aborted) throw new Error('Request aborted');
+        headers.authorization = `Bearer ${config.upstreamApiKeys[index]!}`;
+        result = await transport({ url: upstream, method, headers, ...(body === undefined ? {} : { body }), signal });
+        result.body.on('error', () => { /* The reader reports failures; avoid an unhandled abort before reading. */ });
+        upstreamBody = result.body;
+        if (signal.aborted) throw new Error('Request aborted');
+        if (result.status >= 300 && result.status < 400) throw new ChatError(502, 'upstream_redirect_refused', 'Upstream redirect refused.');
+        if (result.headers['content-encoding'] && result.headers['content-encoding'] !== 'identity') throw new ChatError(502, 'invalid_upstream_response', 'Unsupported upstream content encoding.');
+        if (result.status >= 400) {
+          const contentType = result.headers['content-type'];
+          if (typeof contentType !== 'string' || !/^application\/json(?:\s*;|\s*$)/i.test(contentType) || result.status > 599) throw new ChatError(502, 'invalid_upstream_response', 'Upstream returned an invalid error response.');
+          const bytes = await readResponse(result.body, config.limits.responseBytes, signal);
+          let parsed: unknown;
+          try { parsed = JSON.parse(utf8.decode(bytes)); } catch { throw new ChatError(502, 'invalid_upstream_response', 'Upstream returned an invalid error response.'); }
+          if (!object(parsed) || !object(parsed.error) || typeof parsed.error.message !== 'string') throw new ChatError(502, 'invalid_upstream_response', 'Upstream returned an invalid error response.');
+          const quota = parsed.error.code === 'insufficient_quota' || ((parsed.error.code === null || parsed.error.code === undefined) && parsed.error.type === 'insufficient_quota');
+          if (result.status === 429 && quota && index + 1 < config.upstreamApiKeys.length) continue;
+          error = parsed.error;
+        }
+        break;
+      }
       const contentType = result.headers['content-type'];
       const json = typeof contentType === 'string' && /^application\/json(?:\s*;|\s*$)/i.test(contentType);
       const sse = typeof contentType === 'string' && /^text\/event-stream(?:\s*;|\s*$)/i.test(contentType);
-      if (result.status >= 400) {
-        if (!json || result.status > 599) throw new ChatError(502, 'invalid_upstream_response', 'Upstream returned an invalid error response.');
-        const bytes = await readResponse(result.body, config.limits.responseBytes, signal);
-        let parsed: unknown;
-        try { parsed = JSON.parse(utf8.decode(bytes)); } catch { throw new ChatError(502, 'invalid_upstream_response', 'Upstream returned an invalid error response.'); }
-        if (!object(parsed) || !object(parsed.error) || typeof parsed.error.message !== 'string') throw new ChatError(502, 'invalid_upstream_response', 'Upstream returned an invalid error response.');
-        const error = parsed.error;
+      if (error) {
         const clean = (value: unknown): string | null => typeof value === 'string' ? sanitize(value, secrets, upstream) : null;
         response.statusCode = result.status;
         response.setHeader('Content-Type', 'application/json');

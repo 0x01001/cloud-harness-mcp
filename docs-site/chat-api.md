@@ -20,11 +20,22 @@ description: Run a separate inference-only OpenAI-compatible API on loopback, op
 
 Other routes return `404`; wrong methods return `405`. There is no proxy wildcard, Responses retrieve/delete/cancel API, WebSocket, Anthropic Messages API, admin UI, or browser/CORS support. Use server-side SDKs or command-line clients. Readiness only means local configuration loaded and the process is serving; it does not prove provider authentication, quota, DNS reachability, or model capabilities.
 
-Choose a public HTTPS upstream with **native support for both APIs and `/models`**, and at least one exact model ID that works with both. A Chat-only provider is not sufficient: the app does not translate Chat into Responses, silently drop unknown fields, choose another model, fall back, or retry inference. Model IDs, including `/`, are opaque and forwarded unchanged. Discovery is not a capability certification.
+Choose a public HTTPS upstream with **native support for both APIs and `/models`**, and at least one exact model ID that works with both. A Chat-only provider is not sufficient: the app does not translate Chat into Responses, silently drop unknown fields, choose another model, or fall back to another provider. Model IDs, including `/`, are opaque and forwarded unchanged. Discovery is not a capability certification.
 
 Native request fields and successful JSON/SSE payloads pass through after envelope/content-type checks and byte limits. Tools, tool choices/results, structured output, content arrays, token controls, reasoning items, usage, and metadata work only to the extent the upstream supports them. **Tool definitions and calls are data; this server executes no tools, files, shell commands, or workspace operations.** Chat streams preserve upstream chunks and `[DONE]`; Responses preserve native event names/order/terminal events, without inserting Chat markers. SSE is forwarded with backpressure, not rebuilt into fake completions. An interrupted/oversized/timed-out stream closes; the app does not fabricate success or replay it.
 
 Errors before streaming use OpenAI-style `{ "error": { "message": "...", "type": "...", "param": null, "code": "..." } }`. Missing/malformed/duplicate/wrong Bearer credentials return `401`; invalid JSON/envelope or forbidden models `400`; oversized requests `413`; unsupported media types/content encoding `415`; admission rejection `429`; network/invalid upstream responses `502`; deadline expiry before headers `504`. After SSE headers are sent, the status cannot change: failures close the stream instead of adding ordinary JSON. Native upstream JSON errors preserve status and sanitized error fields; redirects/HTML are not accepted as success. Only safe request IDs and `Retry-After` are forwarded alongside app-controlled content types.
+
+### Quota-only provider-key failover
+
+`CHAT_UPSTREAM_API_KEY` keeps its existing name and accepts either one key or an **ordered comma-separated list of nonempty unique keys, without spaces**, for example `<first-provider-api-key>,<second-provider-api-key>`. Each entry must satisfy the existing key validation: 32–4096 ASCII characters, no whitespace/control characters, and no placeholder values. A single key continues to work.
+
+Every request starts with the first key; each key is attempted at most once. `/v1/models`, `/v1/chat/completions`, and `/v1/responses` advance to the next key **only before the downstream response starts** and only for an HTTP `429` with a valid native JSON error whose `code` equals `insufficient_quota`, or whose `type` equals `insufficient_quota` when `code` is absent/null. A different code takes precedence over type, so a rate-limit code is not quota exhaustion. All attempts use the same endpoint, model, request body, HTTPS policy, admission/concurrency slot, and **one total request deadline**, not a new deadline per key. The prior response body is disposed before the next attempt. If all keys exhaust quota, the last sanitized `429` error is returned.
+
+This is not generic retry or model/provider fallback: ordinary rate-limit `429`, `401`, `5xx`, network failures, timeouts, and malformed/non-JSON errors do not advance keys. There is no sticky/global rotation, and no replay after SSE headers/content or on SSE errors. Sanitized errors redact **all configured client and provider keys**, including provider keys not yet attempted. Keep all secrets out of logs and public examples.
+
+**Multiple keys may share the same provider project quota**, so adding keys does not necessarily add capacity. Stateful Responses continuations using `previous_response_id` can depend on the originating project and are **not portable across projects**; failover to a different project's key can reject the continuation. The app does not migrate state between projects.
+
 
 ## Prepare project-local prerequisites
 
@@ -56,18 +67,19 @@ The chat runtime requires Node.js **>=24**; `make setup` prepares the project-lo
 - [Server configuration](https://github.com/bestagentkits/cloud-harness-mcp/blob/main/apps/chat-api/src/config.ts), [routes](https://github.com/bestagentkits/cloud-harness-mcp/blob/main/apps/chat-api/src/app.ts), and [pinned HTTPS transport](https://github.com/bestagentkits/cloud-harness-mcp/blob/main/apps/chat-api/src/proxy.ts).
 - [Root npm scripts](https://github.com/bestagentkits/cloud-harness-mcp/blob/main/package.json), [macOS runtime](https://github.com/bestagentkits/cloud-harness-mcp/blob/main/scripts/chat-runtime.mjs), and [SDK smoke client](https://github.com/bestagentkits/cloud-harness-mcp/blob/main/scripts/smoke-chat.mjs).
 
-By default, both `npm run start:chat` and the macOS lifecycle load this checkout's `apps/chat-api/.env` (for this checkout, `/Users/vnext/tools/cloud-harness-mcp/apps/chat-api/.env`). The path is derived from the source/compiled module or repository location, **never the current working directory**. `CHAT_CONFIG_FILE` remains an explicit absolute-path override to a private config outside the checkout. The dotenv file is parsed with Node's `parseEnv`, **never sourced/evaluated as shell**: use literal absolute paths, not `$HOME`, `~`, command substitution, or shell expansion inside it. Foreground process environment values override file values. Installed LaunchAgents load their configured file, not your interactive shell environment. Unknown `CHAT_` variables, non-Chat names in that file, or recursive `CHAT_CONFIG_FILE` entries fail startup. Smoke-client-only variables do not belong in the server config/environment.
+By default, both `npm run start:chat` and the macOS lifecycle load this checkout's `apps/chat-api/.env`. The path is derived from the source/compiled module or repository location, **never the current working directory**. `CHAT_CONFIG_FILE` remains an explicit absolute-path override to a private config outside the checkout. The dotenv file is parsed with Node's `parseEnv`, **never sourced/evaluated as shell**: use literal absolute paths, not `$HOME`, `~`, command substitution, or shell expansion inside it. Foreground app environment values override file values, but lifecycle `CHAT_NGROK_CONFIG_FILE` is read only from the selected file. Installed LaunchAgents load their configured file, not your interactive shell environment. Unknown `CHAT_` variables, non-Chat names in that file, or recursive `CHAT_CONFIG_FILE` entries fail startup. Smoke-client-only variables do not belong in the server config/environment.
 
 The **exact repository `apps/chat-api/.env` is the only checkout exception**: it must be an owner-owned regular file at **exact `0600`**. Its immediate parent must be owner-owned and not group/world writable; ordinary **`0755` is allowed**. Both the leaf and immediate parent must not be symlinks. Every other private file—including the primary `CHAT_API_KEY_FILE`, generated client keys, ngrok config, and an explicit external config override—must resolve outside the checkout, with an owner-owned regular file at **exact `0600`** and owner-owned containing directory at **exact `0700`**. The optional generated-key directory `${CHAT_API_KEY_FILE}.d` also requires owner ownership and exact `0700`. Leaf/immediate-parent symlinks are rejected; this is not a blanket ban on every ancestor symlink. The config is capped at 64 KiB. Each key is 32–4096 printable non-whitespace ASCII characters (a client key file may end with one newline); placeholders are rejected. Every client key must differ from the provider credential; never reuse MCP or ngrok credentials. Missing/invalid settings, unsafe key files/directories, or invalid generated-key entries fail before listening.
 
 | Setting | Meaning / default |
 | --- | --- |
 | `CHAT_API_KEY_FILE` | Required absolute private primary chat-client key file; optional sibling `${CHAT_API_KEY_FILE}.d` contains additive `*.key` files |
-| `CHAT_UPSTREAM_API_KEY` | Required provider credential inline in the private dotenv config; no provider-key file |
+| `CHAT_UPSTREAM_API_KEY` | Required inline provider key, or ordered nonempty unique comma-separated keys without spaces; no provider-key file |
 | `CHAT_UPSTREAM_BASE_URL` | Required public HTTPS base ending in `/v1`; a prefix before `/v1` is preserved |
 | `CHAT_ALLOWED_MODELS` | Required nonempty comma-separated unique exact model IDs; no whitespace inside an ID |
 | `CHAT_API_PORT` | Loopback port, `3211`; listener is always `127.0.0.1` |
 | `CHAT_PUBLIC_HOST` | Optional exact lowercase public hostname for foreground local-only use; required by tunnel lifecycle, without scheme/path/port |
+| `CHAT_NGROK_CONFIG_FILE` | Required for lifecycle install/start/status: literal absolute path in the selected Chat `.env` to the separate private ngrok config; no default/shared-config fallback or ambient shell override |
 | `CHAT_MAX_REQUEST_BYTES` | `4194304` (4 MiB), maximum `67108864` |
 | `CHAT_MAX_RESPONSE_BYTES` | `16777216` (16 MiB), maximum `268435456`, including SSE |
 | `CHAT_MAX_CONCURRENT_REQUESTS` | `4`, maximum `128` |
@@ -80,14 +92,15 @@ Copy the maintained [chat-only `.env.example`](https://github.com/bestagentkits/
 
 ```dotenv
 CHAT_API_PORT=3211
-CHAT_API_KEY_FILE="/Users/operator/Library/Application Support/cloudharness-chat/chat.key"
+CHAT_API_KEY_FILE=/absolute/private/chat.key
 CHAT_UPSTREAM_API_KEY=<provider-api-key>
 CHAT_UPSTREAM_BASE_URL=https://<public-provider-host>/v1
 CHAT_ALLOWED_MODELS=<exact-native-model-id>
 CHAT_PUBLIC_HOST=<assigned-ngrok-host>
+CHAT_NGROK_CONFIG_FILE=/absolute/private/ngrok-translate.yml
 ```
 
-`CHAT_API_KEY_FILE` is **not** an OpenAI/provider credential. It names the external primary client-key file. At startup the server accepts that primary key plus keys in the optional sibling `${CHAT_API_KEY_FILE}.d` directory. Every accepted key has the same full inference access and shares the same per-instance admission limits and provider quota: these are not per-user accounts, separate budgets, or admin credentials. The server validates incoming Bearer auth against these client keys, then independently uses inline `CHAT_UPSTREAM_API_KEY` for outgoing provider Authorization. The removed `CHAT_UPSTREAM_API_KEY_FILE` setting is rejected; there is no backwards alias and no `provider.key` to create.
+`CHAT_API_KEY_FILE` is **not** an OpenAI/provider credential. It names the external primary client-key file. At startup the server accepts that primary key plus keys in the optional sibling `${CHAT_API_KEY_FILE}.d` directory. Every accepted key has the same full inference access and shares the same per-instance admission limits and provider quota: these are not per-user accounts, separate budgets, or admin credentials. **Every primary/generated client key, including newly generated keys, must differ from every configured provider key.** The server validates incoming Bearer auth against these client keys, then independently selects a key from inline `CHAT_UPSTREAM_API_KEY` for outgoing provider Authorization. The removed `CHAT_UPSTREAM_API_KEY_FILE` setting is rejected; there is no backwards alias and no `provider.key` to create.
 
 ### Create a client key without replacing existing keys
 
@@ -105,7 +118,7 @@ The generator creates missing private directories at `0700` and key files at `06
 
 Copy the printed key directly into `Authorization: Bearer <chat-key>`, **never the file path or provider credential**. Securely distribute it to the intended authorized client using your encrypted credential-sharing workflow; a recipient stores it in its own private file/credential store. **Terminal output is now sensitive: avoid CI runs and shared or captured logs when generating keys.** Keep actual secrets out of the example template, argv, URLs, shell history, plist, commits, and logs. The app-local `.env` is ignored by Git, but that is not encryption or protection from local-user processes: never force-add it. An external `CHAT_CONFIG_FILE` config contains the same inline provider value and follows the stricter `0600`/`0700` rules.
 
-**New keys become accepted only after the server restarts.** For an already-installed macOS runtime, use `make stop` then `make start` (or `npm run chat:stop` then `npm run chat:start`), retaining the same config-path override. `make start` alone does not restart a running app. For foreground operation, stop the process and run `npm run start:chat` again. Neither key generation nor file edits trigger automatic reload or service manipulation; restarts abort active calls rather than replaying them.
+**Adding, removing, or changing any client or provider key takes effect only after the server restarts.** For an already-installed macOS runtime, use `make stop` then `make start` (or `npm run chat:stop` then `npm run chat:start`), retaining the same config-path override. `make start` alone does not restart a running app. For foreground operation, stop the process and run `npm run start:chat` again. Neither key generation nor file edits trigger automatic reload or service manipulation; restarts abort active calls rather than replaying them.
 
 ## Foreground first
 
@@ -192,7 +205,33 @@ The root `Makefile` wraps npm key-generation/lifecycle commands; `package.json` 
 
 The macOS **service lifecycle** commands require a logged-in user session, supported Node/npm, and ngrok in `PATH`; `make setup` prepares these tools as described above. Key generation needs Node/npm and the private config, not ngrok or installed services. Lifecycle commands themselves install no package manager/runtime, do not modify Docker/Colima/MCP, and do not rebuild on login. Install captures absolute executable/checkout paths, including the project-local Node executable when invoked through `make install` after setup: **do not remove `.local-runtime/` while its LaunchAgents are installed**. Reinstall registration after moving the checkout or changing selected executables. Repeated install does not rotate keys or create a second job for the same config path. Do not put credentials in a plist.
 
-Configure ngrok privately outside the checkout at `~/Library/Application Support/ngrok/ngrok.yml` or `~/.config/ngrok/ngrok.yml`, exact file `0600`/parent `0700`, with its **own authtoken** and an account-assigned domain. Installer checks `ngrok http --help` flags and `ngrok config check`; it does not silently create credentials. `CHAT_PUBLIC_HOST` must match the assigned hostname. The tunnel forwards only `http://127.0.0.1:<CHAT_API_PORT>` with `--url https://<CHAT_PUBLIC_HOST>` and **`--inspect=false`**. It starts only after the expected chat PID/parent/exact listener is ready, and stops/restarts on lost ownership/readiness rather than forwarding to an unrelated process. Ngrok logging is disabled (`--log=false`) and raw child output is suppressed; separate runtime/app/tunnel lifecycle logs each rotate at 256 KiB with three retained copies.
+### Dedicated ngrok configuration
+
+Set `CHAT_NGROK_CONFIG_FILE` in the selected private Chat `.env` to a **literal absolute path** to the dedicated ngrok config, for example `CHAT_NGROK_CONFIG_FILE=/absolute/private/ngrok-translate.yml`. Chat lifecycle reads only that file's setting, not an ambient shell override, and always passes explicit `--config`; there is **no default or shared-config fallback**. Direct loopback app startup and key generation do not require this setting. Lifecycle install/start/status do; stop/uninstall/logs remain available for the verified instance without reading it. The same ngrok executable can serve another application, but Chat needs a **separate configuration and its own authtoken**. Do not copy another application's secrets, modify its config, or stop its agent.
+
+If the dedicated file is already configured, leave its existing authtoken untouched: **no `add-authtoken` command is needed**. Enforce owner-owned exact file `0600` and immediate directory `0700`; neither may be a symlink. Replace these placeholder paths with the dedicated file and its immediate directory before applying permission-only commands:
+
+```sh
+chmod 0700 /absolute/private
+chmod 0600 /absolute/private/ngrok-translate.yml
+```
+
+These are operator instructions, not operations performed by setup, and do not alter the other application's `ngrok.yml` or its token. If creating a **new** dedicated config instead, create its private directory/file first under `umask 077`, enforce `chmod 0700`/`chmod 0600`, and select its absolute path in `CHAT_NGROK_CONFIG_FILE`. Use a **private editor** for the following [ngrok v3 configuration](https://ngrok.com/docs/gateway/agent/config/v3), replacing only the placeholder with a separately issued authtoken. Do not overwrite an existing configured token, paste real tokens into commands, this guide, tool output, shared logs, or the repository. Disable the local inspection web interface to avoid colliding with another agent's default port 4040:
+
+```yaml
+version: 3
+agent:
+  authtoken: <dedicated-ngrok-translate-authtoken>
+  web_addr: false
+```
+
+**Never run bare `ngrok config add-authtoken`**: it can overwrite the default config used by another application. Only if a dedicated file still needs a token and you choose the CLI rather than the recommended private editor, the explicitly scoped form is `ngrok config add-authtoken <dedicated-ngrok-translate-authtoken> --config /absolute/private/ngrok-translate.yml`; replace the path with the exact selected config path. That placeholder is not a real token. Substituting a real token exposes it in process arguments and potentially shell history, so avoid that method in shared/recorded environments and retain the private permissions above.
+
+Choose an account-assigned **different domain** from any other application's active tunnel and set `CHAT_PUBLIC_HOST` to that exact hostname. Separate configs/tokens do **not** bypass ngrok agent/session, endpoint, or account limits; arrange sufficient account capacity or a separately authorized account instead of disrupting another agent.
+
+Install preflights `ngrok http --help` flags and `ngrok config check` with the dedicated `--config` path; it does not create credentials. Both install and start keep the scoped LaunchAgent labels/state and pass this explicit `--config` to ngrok. The tunnel forwards only `http://127.0.0.1:<CHAT_API_PORT>` with `--url https://<CHAT_PUBLIC_HOST>` and **`--inspect=false`**. It starts only after the expected chat PID/parent/exact listener is ready, and stops/restarts on lost ownership/readiness rather than forwarding to an unrelated process. Ngrok logging is disabled (`--log=false`) and raw child output is suppressed; separate runtime/app/tunnel lifecycle logs each rotate at 256 KiB with three retained copies.
+
+**Existing registration migration:** install pins the selected ngrok config path in the instance manifest. A prior manifest selecting a shared config, or any change to `CHAT_NGROK_CONFIG_FILE`, requires reinstall before start; start will not silently use the old path. Stop/uninstall only that verified Chat instance's jobs, retaining its exact `CHAT_CONFIG_FILE` override if applicable, then `make install` the intended instance after selecting and securing its dedicated ngrok config. Changing configuration does not migrate old registrations. Stop/uninstall can clean up verified old jobs but must not target another application's ngrok process or configuration.
 
 LaunchAgents run foreground supervisors after login, not system boot; availability before login/after logout is not promised. Restart loops are bounded (five starts per ten minutes, 30-second delay). Sleep, logout, lost network, provider outages, and tunnel disruption can end streams. Nothing replays inference after restart/reconnect. This is not HA: the host, ngrok, and provider must all remain available.
 
