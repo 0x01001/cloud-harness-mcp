@@ -1,11 +1,12 @@
 import { execFile } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { PassThrough } from 'node:stream';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { appReady, assertRuntime, bootstrap, bootout, checkNgrokHelp, healthReady, jobOwned, lifecycleLog, listenerOwned, ngrokArgs, ngrokConfigFile, plist, privateFile, readConfigEnv, resolveExecutable, restartAllowed, runtimePaths } from '../scripts/chat-runtime.mjs';
+import { appReady, assertRuntime, bootstrap, bootout, checkNgrokHelp, consumeAppLog, flushLifecycleLogs, healthReady, jobOwned, lifecycleLog, listenerOwned, ngrokArgs, ngrokConfigFile, plist, privateFile, readConfigEnv, resolveExecutable, restartAllowed, runtimePaths, viewLogs } from '../scripts/chat-runtime.mjs';
 import type { RuntimeManifest } from '../scripts/chat-runtime.mjs';
 
 const exec = promisify(execFile);
@@ -297,4 +298,97 @@ describe('isolated chat runtime', () => {
     expect(await readFile(path.join(paths.state, 'app.log'), 'utf8')).not.toContain(providerKey);
     await expect(lifecycleLog(paths.state, 'raw request {"authorization":"secret"}')).rejects.toThrow('Unsafe');
   });
+
+  it('accepts only anchored fixed request metadata and serializes bounded private writes', async () => {
+    const { paths } = await fixture();
+    const id = 'cba5322a-3c17-4b8e-8e0f-12ce8bc85a39';
+    const request = `app request id=${id} method=POST route=chat-completions`;
+    const response = `app response id=${id} status=200 duration_ms=7 outcome=finished`;
+    const send = (event: string) => consumeAppLog(paths.state, { type: 'chat-request-log', event });
+    for (const invalid of [
+      `${request}\n`, `${request}\nsecret`, `secret ${request}`, `${request} body=secret`,
+      request.replace('POST', 'SECRET'), request.replace('chat-completions', '/v1/chat/completions?secret'),
+      request.replace(id, 'user-supplied-secret'), response.replace('status=200', 'status=999'),
+      response.replace('duration_ms=7', 'duration_ms=-1'), response.replace('finished', 'secret'),
+      `app raw secret`, 'secret'.repeat(1000)
+    ]) send(invalid);
+    consumeAppLog(paths.state, { type: 'other', event: request });
+    consumeAppLog(paths.state, { type: 'chat-request-log', event: { secret: true } });
+    consumeAppLog(paths.state, null);
+    send(request);
+    send(response);
+    send(response.replace('status=200', 'status=0').replace('finished', 'aborted'));
+    await flushLifecycleLogs(paths.state);
+    const logged = await readFile(path.join(paths.state, 'app.log'), 'utf8');
+    expect(logged.trim().split('\n').map((line) => line.slice(25))).toEqual([
+      request, response, response.replace('status=200', 'status=0').replace('finished', 'aborted')
+    ]);
+    expect(logged).not.toContain('secret');
+    expect((await stat(path.join(paths.state, 'app.log'))).mode & 0o777).toBe(0o600);
+    await writeFile(path.join(paths.state, 'app.log'), '');
+    for (let index = 0; index < 1100; index++) send(request);
+    await flushLifecycleLogs(paths.state);
+    expect((await readFile(path.join(paths.state, 'app.log'), 'utf8')).trim().split('\n')).toHaveLength(1024);
+  });
+
+  it('contains log IO failures and recovers on the next event', async () => {
+    const { paths } = await fixture();
+    const missing = path.join(paths.state, 'missing');
+    await expect(lifecycleLog(missing, 'app started')).resolves.toBeUndefined();
+    await mkdir(missing, { mode: 0o700 });
+    await lifecycleLog(missing, 'app exited');
+    expect(await readFile(path.join(missing, 'app.log'), 'utf8')).toContain('app exited');
+  });
+
+  it('prints only recent current scoped logs in finite mode and creates missing private files', async () => {
+    const { paths } = await fixture();
+    await writeFile(path.join(paths.state, 'app.log'), Array.from({ length: 70 }, (_, index) => `app event-${index}\n`).join(''), { mode: 0o600 });
+    await writeFile(path.join(paths.state, 'app.log.1'), 'archived-secret\n');
+    await writeFile(path.join(paths.state, 'other.log'), 'unscoped-secret\n');
+    const output = new PassThrough();
+    let text = '';
+    output.on('data', (chunk) => { text += chunk.toString(); });
+    await viewLogs(paths.state, { follow: false, output });
+    expect(text.trim().split('\n')).toHaveLength(50);
+    expect(text).toContain('app event-20\n');
+    expect(text).toContain('app event-69\n');
+    expect(text).not.toContain('secret');
+    for (const scope of ['runtime', 'app', 'tunnel']) expect((await stat(path.join(paths.state, `${scope}.log`))).mode & 0o777).toBe(0o600);
+    output.destroy();
+  });
+
+  it('follows real appends and rotation without duplicating events and stops on abort', async () => {
+    const { paths } = await fixture();
+    await lifecycleLog(paths.state, 'app started');
+    const output = new PassThrough();
+    const controller = new AbortController();
+    let text = '';
+    output.on('data', (chunk) => { text += chunk.toString(); });
+    const following = viewLogs(paths.state, { signal: controller.signal, output });
+    const seen = (event: string) => new Promise<void>((resolve) => {
+      const check = () => {
+        if (text.includes(event)) { output.off('data', check); resolve(); }
+      };
+      output.on('data', check);
+      check();
+    });
+    try {
+      await seen('app started');
+      await lifecycleLog(paths.state, 'app ordinary-append');
+      await seen('app ordinary-append');
+      expect(text.match(/app started/g)).toHaveLength(1);
+      expect(text.match(/app ordinary-append/g)).toHaveLength(1);
+      await rename(path.join(paths.state, 'app.log'), path.join(paths.state, 'app.log.1'));
+      await lifecycleLog(paths.state, 'app after-rotation');
+      await seen('app after-rotation');
+      expect(text.match(/app after-rotation/g)).toHaveLength(1);
+    } finally {
+      controller.abort();
+      await following;
+      output.destroy();
+    }
+    const stopped = text;
+    await lifecycleLog(paths.state, 'app after-abort');
+    expect(text).toBe(stopped);
+  }, 20_000);
 });

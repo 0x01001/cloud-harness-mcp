@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { once } from 'node:events';
 import type { Readable } from 'node:stream';
@@ -123,7 +123,7 @@ function safeHeaders(response: ServerResponse, headers: Record<string, string | 
   }
 }
 
-export function createChatServer(config: ChatConfig, dependencies: ProxyDependencies & { transport?: ProxyTransport; now?: () => number } = {}): Server {
+export function createChatServer(config: ChatConfig, dependencies: ProxyDependencies & { transport?: ProxyTransport; now?: () => number; log?: (event: string) => void } = {}): Server {
   const transport = dependencies.transport ?? createProxyTransport(dependencies);
   const now = dependencies.now ?? Date.now;
   const active = new Set<AbortController>();
@@ -131,6 +131,37 @@ export function createChatServer(config: ChatConfig, dependencies: ProxyDependen
   let admitted = 0;
   let stopping = false;
   const server = createServer({ maxHeaderSize: 16 * 1024, requireHostHeader: true }, (request, response) => {
+    if (dependencies.log) {
+      const id = randomUUID();
+      const started = performance.now();
+      const log = (event: string) => {
+        try { dependencies.log!(event); } catch { /* Observability must not affect requests. */ }
+      };
+      const method = /^(?:GET|POST|HEAD|OPTIONS|PUT|PATCH|DELETE)$/.test(request.method ?? '') ? request.method : 'OTHER';
+      let route = 'unknown';
+      switch (request.url) {
+        case '/healthz': route = 'healthz'; break;
+        case '/readyz': route = 'readyz'; break;
+        case '/v1/models': route = 'models'; break;
+        case '/v1/chat/completions': route = 'chat-completions'; break;
+        case '/v1/responses': route = 'responses'; break;
+      }
+      const probe = method === 'GET' && (route === 'healthz' || route === 'readyz');
+      const arrival = `app request id=${id} method=${method} route=${route}`;
+      const complete = (outcome: 'finished' | 'aborted') => {
+        response.off('finish', finish);
+        response.off('close', close);
+        const status = response.headersSent ? response.statusCode : 0;
+        if (probe && outcome === 'finished' && status === 200) return;
+        if (probe) log(arrival);
+        log(`app response id=${id} status=${status} duration_ms=${Math.max(0, Math.floor(performance.now() - started))} outcome=${outcome}`);
+      };
+      const finish = () => complete('finished');
+      const close = () => complete('aborted');
+      response.once('finish', finish);
+      response.once('close', close);
+      if (!probe) log(arrival);
+    }
     void handle(request, response);
   });
   controllers.set(server, active);

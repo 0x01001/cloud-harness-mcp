@@ -1,7 +1,7 @@
 import { spawn, execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { access, chmod, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { access, chmod, lstat, mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { clearInterval, setInterval } from 'node:timers';
@@ -16,6 +16,9 @@ const ps = '/bin/ps';
 const lsof = '/usr/sbin/lsof';
 const MAX_LOG_BYTES = 256 * 1024;
 const LOG_COPIES = 3;
+const LOG_QUEUE_LIMIT = 1024;
+const logWrites = new Map();
+const APP_LOG_EVENT = /^app (?:request id=[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12} method=(?:GET|POST|HEAD|OPTIONS|PUT|PATCH|DELETE|OTHER) route=(?:healthz|readyz|models|chat-completions|responses|unknown)|response id=[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12} status=(?:0|[1-5][0-9]{2}) duration_ms=(?:0|[1-9][0-9]*) outcome=(?:finished|aborted))(?![\s\S])/;
 const RESTART_WINDOW_MS = 10 * 60_000;
 const RESTART_LIMIT = 5;
 const CONFIG_KEYS = new Set(['CHAT_API_PORT', 'CHAT_API_KEY_FILE', 'CHAT_UPSTREAM_BASE_URL', 'CHAT_UPSTREAM_API_KEY', 'CHAT_ALLOWED_MODELS', 'CHAT_PUBLIC_HOST', 'CHAT_NGROK_CONFIG_FILE', 'CHAT_MAX_REQUEST_BYTES', 'CHAT_MAX_RESPONSE_BYTES', 'CHAT_MAX_CONCURRENT_REQUESTS', 'CHAT_REQUESTS_PER_MINUTE', 'CHAT_REQUEST_DEADLINE_MS']);
@@ -139,8 +142,34 @@ async function atomicPrivate(filename, contents) {
 }
 
 export async function lifecycleLog(state, event) {
-  // Only callers' fixed lifecycle vocabulary reaches disk; never child output.
+  // Only fixed lifecycle vocabulary or validated request metadata reaches disk.
   if (!/^[a-z0-9 _=:-]+$/i.test(event) || event.length > 160) throw new Error('Unsafe lifecycle log event.');
+  let writes = logWrites.get(state);
+  if (!writes) {
+    writes = { pending: 0, tail: Promise.resolve() };
+    logWrites.set(state, writes);
+  }
+  // ponytail: drop new events above 1024 pending writes; use producer backpressure if lossless logging is required.
+  if (writes.pending >= LOG_QUEUE_LIMIT) return;
+  writes.pending++;
+  writes.tail = writes.tail.then(() => writeLifecycleLog(state, event)).catch(() => {
+    // Logging failure must not restart the app or crash its supervisor.
+  }).finally(() => {
+    if (--writes.pending === 0) logWrites.delete(state);
+  });
+  await writes.tail;
+}
+
+export async function flushLifecycleLogs(state) {
+  await logWrites.get(state)?.tail;
+}
+
+export function consumeAppLog(state, message) {
+  if (!message || message.type !== 'chat-request-log' || typeof message.event !== 'string' || message.event.length > 160 || !APP_LOG_EVENT.test(message.event)) return;
+  void lifecycleLog(state, message.event);
+}
+
+async function writeLifecycleLog(state, event) {
   const scope = event.startsWith('app ') ? 'app' : event.startsWith('tunnel ') ? 'tunnel' : 'runtime';
   const filename = path.join(state, `${scope}.log`);
   const line = `${new Date().toISOString()} ${event}\n`;
@@ -152,8 +181,38 @@ export async function lifecycleLog(state, event) {
       try { await rename(index ? `${filename}.${index}` : filename, `${filename}.${index + 1}`); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
   }
-  await writeFile(filename, line, { flag: 'a', mode: 0o600 });
-  await chmod(filename, 0o600);
+  const file = await open(filename, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+  try {
+    await file.chmod(0o600);
+    await file.write(line);
+  } finally { await file.close(); }
+}
+
+/**
+ * @param {string} state
+ * @param {{ follow?: boolean, signal?: AbortSignal, output?: import('node:stream').Writable }} options
+ */
+export async function viewLogs(state, { follow = true, signal, output = process.stdout } = {}) {
+  const files = ['runtime', 'app', 'tunnel'].map((scope) => path.join(state, `${scope}.log`));
+  for (const filename of files) {
+    const file = await open(filename, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+    try { await file.chmod(0o600); } finally { await file.close(); }
+  }
+  if (signal?.aborted) return;
+  const child = spawn('/usr/bin/tail', ['-q', '-n', '50', ...(follow ? ['-F'] : []), ...files], { stdio: ['ignore', 'pipe', 'ignore'] });
+  const stop = () => child.kill('SIGTERM');
+  signal?.addEventListener('abort', stop, { once: true });
+  child.stdout.pipe(output, { end: false });
+  try {
+    await new Promise((resolve, reject) => {
+      child.once('error', () => reject(new Error('Unable to read scoped Chat logs.')));
+      child.once('close', (code) => signal?.aborted || code === 0 ? resolve() : reject(new Error('Unable to read scoped Chat logs.')));
+      if (signal?.aborted) stop();
+    });
+  } finally {
+    signal?.removeEventListener('abort', stop);
+    child.stdout.unpipe(output);
+  }
 }
 
 async function command(binary, args) {
@@ -324,9 +383,10 @@ async function foreground(manifest, kind) {
         if (kind === 'tunnel') await waitReady(manifest, config.port, 30_000, shutdown.signal);
         if (stopping) break;
         child = spawn(kind === 'app' ? manifest.node : manifest.ngrok, kind === 'app' ? [manifest.entry] : ngrokArgs(manifest, config), {
-          cwd: manifest.root, env, stdio: 'ignore'
+          cwd: manifest.root, env, stdio: kind === 'app' ? ['ignore', 'ignore', 'ignore', 'ipc'] : 'ignore'
         });
-        const done = new Promise((resolve) => { child.once('error', () => resolve()); child.once('exit', resolve); });
+        if (kind === 'app') child.on('message', (message) => consumeAppLog(manifest.state, message));
+        const done = new Promise((resolve) => { child.once('error', () => {}); child.once('close', resolve); });
         if (child.pid) await atomicPrivate(path.join(manifest.state, `${kind}.json`), JSON.stringify({ launcher: process.pid, pid: child.pid }));
         await lifecycleLog(manifest.state, `${kind} started`);
         if (kind === 'tunnel') {
@@ -349,6 +409,7 @@ async function foreground(manifest, kind) {
           }, 2000);
         }
         await done;
+        await flushLifecycleLogs(manifest.state);
         await lifecycleLog(manifest.state, `${kind} exited`);
       } catch { await lifecycleLog(manifest.state, `${kind} prerequisite-or-process-failure`); }
       finally {
@@ -437,7 +498,9 @@ export async function main(argv = process.argv.slice(2)) {
   assertRuntime();
   process.umask(0o077);
   const action = argv[0];
-  if (!['install', 'start', 'status', 'logs', 'stop', 'uninstall', '--app', '--tunnel'].includes(action) || argv.length !== (action.startsWith('--') ? 2 : 1)) throw new Error('Usage: chat-runtime.mjs install|start|status|logs|stop|uninstall');
+  const valid = ['install', 'start', 'status', 'logs', 'stop', 'uninstall', '--app', '--tunnel'].includes(action)
+    && (action === 'logs' ? argv.length === 1 || (argv.length === 2 && argv[1] === '--no-follow') : argv.length === (action.startsWith('--') ? 2 : 1));
+  if (!valid) throw new Error('Usage: chat-runtime.mjs install|start|status|logs [--no-follow]|stop|uninstall');
   const paths = runtimePaths();
   if (action === 'install') return install(paths);
   const manifest = await readManifest(paths);
@@ -457,10 +520,14 @@ export async function main(argv = process.argv.slice(2)) {
     return;
   }
   if (action === 'logs') {
-    for (const scope of ['runtime', 'app', 'tunnel']) {
-      for (let index = LOG_COPIES; index >= 0; index--) {
-        try { process.stdout.write(await readFile(path.join(manifest.state, index ? `${scope}.log.${index}` : `${scope}.log`), 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-      }
+    const shutdown = new globalThis.AbortController();
+    const stop = () => shutdown.abort();
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+    try { await viewLogs(manifest.state, { follow: argv[1] !== '--no-follow', signal: shutdown.signal }); }
+    finally {
+      process.off('SIGINT', stop);
+      process.off('SIGTERM', stop);
     }
     return;
   }
@@ -477,7 +544,7 @@ export async function main(argv = process.argv.slice(2)) {
 if (process.argv[1] && path.resolve(process.argv[1]) === script) {
   main().catch(() => {
     // Do not print arbitrary exception messages (config/build/agent may echo secrets).
-    console.error('Chat runtime command failed. Check Node >=24, macOS login session, private config permissions, build:chat and ngrok prerequisites. Set CHAT_NGROK_CONFIG_FILE in the private chat config to an absolute dedicated ngrok-translate config path (0600 file, 0700 parent directory); no default ngrok config is used. Run chat:install after changing this path; chat:stop and chat:uninstall remain available. Use chat:logs for sanitized lifecycle events.');
+    console.error('Chat runtime command failed. Usage: chat-runtime.mjs install|start|status|logs [--no-follow]|stop|uninstall. Check Node >=24, macOS login session, private config permissions, build:chat and ngrok prerequisites. Set CHAT_NGROK_CONFIG_FILE in the private chat config to an absolute dedicated ngrok-translate config path (0600 file, 0700 parent directory); no default ngrok config is used. Run chat:install after changing this path; chat:stop and chat:uninstall remain available. Use make log for realtime sanitized lifecycle and request metadata; make log LOG_ARGS=--no-follow prints recent events once.');
     process.exitCode = 1;
   });
 }

@@ -3,7 +3,11 @@ import { createChatServer, shutdownChatServer } from './app.js';
 
 async function main(): Promise<void> {
   const config = await loadChatConfig();
-  const server = createChatServer(config);
+  const server = createChatServer(config, { log: event => {
+    if (process.send) {
+      try { process.send({ type: 'chat-request-log', event }, () => { /* Ignore IPC disconnects. */ }); } catch { /* The supervisor may have exited. */ }
+    } else console.info(`${new Date().toISOString()} ${event}`);
+  } });
   const listening = Promise.withResolvers<void>();
   const bindFailure = () => listening.reject(new Error('Listener unavailable'));
   server.once('error', bindFailure);

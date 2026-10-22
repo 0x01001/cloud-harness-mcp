@@ -1,6 +1,6 @@
 export PATH := $(CURDIR)/.local-runtime/node_modules/.bin:$(PATH)
 
-.PHONY: setup gen install start status logs stop uninstall
+.PHONY: setup gen install start status log stop uninstall
 
 setup:
 	PATH="$(PATH)" npm run chat:setup
@@ -17,8 +17,8 @@ start:
 status:
 	PATH="$(PATH)" npm run chat:status
 
-logs:
-	PATH="$(PATH)" npm run chat:logs
+log:
+	@PATH="$(PATH)" npm --silent run chat:logs -- $(LOG_ARGS)
 
 stop:
 	PATH="$(PATH)" npm run chat:stop

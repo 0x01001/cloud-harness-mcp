@@ -27,7 +27,9 @@ The systemd and Compose owners are
 The [Chat API guide](chat-api.md) covers foreground startup, SDK smoke, and the
 chat-only macOS lifecycle. Command authority is [`package.json`](../package.json);
 [`scripts/chat-runtime.mjs`](../scripts/chat-runtime.mjs) owns scoped LaunchAgents,
-readiness/ownership checks, ngrok, and bounded sanitized logs. Its readiness
+readiness/ownership checks, ngrok, and bounded sanitized logs. `make log` follows
+lifecycle and request/response metadata; see the guide for snapshot mode and
+restart requirements. Its readiness
 does not probe the provider, and its stop/uninstall does not touch MCP state.
 Rotate the shared chat key by replacing its private file and restarting; revoke
 provider/ngrok credentials separately. No conversations are stored locally;

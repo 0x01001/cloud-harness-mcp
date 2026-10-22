@@ -7,7 +7,7 @@ import type { ChatConfig } from '../src/config.js';
 import type { ProxyTransport, ProxyResponse } from '../src/proxy.js';
 
 export type FixtureHandler = (request: IncomingMessage, response: ServerResponse) => void | Promise<void>;
-export type FixtureOptions = { limits?: Partial<ChatConfig['limits']>; now?: () => number; apiKeys?: readonly string[]; upstreamKeys?: readonly string[] };
+export type FixtureOptions = { limits?: Partial<ChatConfig['limits']>; now?: () => number; log?: (event: string) => void; apiKeys?: readonly string[]; upstreamKeys?: readonly string[] };
 export const CHAT_KEY = 'chat-test-key-not-a-provider-key-1234567890';
 export const PROVIDER_KEY = 'provider-test-secret-12345678901234567890';
 export const MODEL = 'openai/native-model';
@@ -73,7 +73,7 @@ export async function fixture(handler: FixtureHandler, options: FixtureOptions =
     req.end(body);
     return promise;
   };
-  const server = createChatServer(config(options.limits, options.apiKeys, options.upstreamKeys), { transport, now: options.now });
+  const server = createChatServer(config(options.limits, options.apiKeys, options.upstreamKeys), { transport, now: options.now, log: options.log });
   const base = await listen(server);
   return {
     server, upstream, base, captured,

@@ -199,9 +199,17 @@ The root `Makefile` wraps npm key-generation/lifecycle commands; `package.json` 
 | `make install` | `npm run chat:install` | Preflight, build chat, register two user LaunchAgents, start app then tunnel |
 | `make start` | `npm run chat:start` | Start registered app, await owned readiness, start tunnel |
 | `make status` | `npm run chat:status` | Check owned app/PID/listener and tunnel process; not public connectivity/model proof |
-| `make logs` | `npm run chat:logs` | Read finite sanitized lifecycle logs, not raw app/ngrok traffic |
+| `make log` / `make logs` | `npm run chat:logs` | Follow recent sanitized lifecycle and request/response metadata live; Ctrl-C exits the viewer only |
 | `make stop` | `npm run chat:stop` | Stop this instance's tunnel then app |
 | `make uninstall` | `npm run chat:uninstall` | Stop jobs/remove registrations; retain private config, keys, logs, and MCP data |
+
+### Live request and response logs
+
+Run `make log` to display the last 50 lines of each current scoped log and keep following new events, including after rotation. `make logs` is equivalent. To print recent records and exit, use `make log LOG_ARGS=--no-follow` or `npm run chat:logs -- --no-follow`. Keep the same `CHAT_CONFIG_FILE` override as your installed instance. Viewing logs never starts or restarts services; Ctrl-C stops only the viewer.
+
+API requests get an arrival record with a generated correlation ID, method and fixed route label. The matching response record contains HTTP status, elapsed milliseconds and `finished` or `aborted`; an abort before headers has status `0`. Successful `GET /healthz` and `GET /readyz` checks are silent; failed or aborted checks emit both records on completion. The tunnel's readiness monitoring still runs; only successful probe logging is suppressed. An SSE response is recorded when it finishes or disconnects, not once per token. No prompt, completion, body, header, query string, model ID or credential is recorded. Unknown routes/methods use fixed labels rather than echoing input. Logs are bounded diagnostics, not an audit ledger: saturated queues or disk failures may drop records.
+
+For an already-installed older runtime, run `PATH="$PWD/.local-runtime/node_modules/.bin:$PATH" npm run build:chat`, then `make stop` and `make start` with its existing config-path override before `make log`. This interrupts active calls and restarts its tunnel; choose an appropriate maintenance window. `make start` alone does not replace a running process. Foreground `npm run start:chat` prints the same safe metadata directly to its terminal after rebuild/restart.
 
 The macOS **service lifecycle** commands require a logged-in user session, supported Node/npm, and ngrok in `PATH`; `make setup` prepares these tools as described above. Key generation needs Node/npm and the private config, not ngrok or installed services. Lifecycle commands themselves install no package manager/runtime, do not modify Docker/Colima/MCP, and do not rebuild on login. Install captures absolute executable/checkout paths, including the project-local Node executable when invoked through `make install` after setup: **do not remove `.local-runtime/` while its LaunchAgents are installed**. Reinstall registration after moving the checkout or changing selected executables. Repeated install does not rotate keys or create a second job for the same config path. Do not put credentials in a plist.
 
